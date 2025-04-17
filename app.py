@@ -5,7 +5,7 @@ from flask_cors import CORS
 from mistralai import Mistral
 
 app = Flask(__name__)
-CORS(app, origins=["https://finance-bot-frontend.vercel.app/", "http://localhost:3000"])
+CORS(app, origins=["https://finance-bot-frontend.vercel.app", "http://localhost:3000"])
 
 # Mistral API Configuration
 MISTRAL_API_KEY = "pcrrbcrfeX4lp11mICMNDBTDhzrY4QIf" # Replace with your actual API key or use environment variable
