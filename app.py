@@ -21,8 +21,8 @@ CORS(app,
 
 # API Configuration
 MISTRAL_API_KEY = os.getenv("MISTRAL_API_KEY", "QKIr9flpqitrfwPJP1PsVf83I03jUUdd")
-FINNHUB_API_KEY = os.getenv("FINNHUB_API_KEY", "")
-ALPHA_VANTAGE_API_KEY = os.getenv("ALPHA_VANTAGE_API_KEY", "")
+FINNHUB_API_KEY = os.getenv("FINNHUB_API_KEY", "cvu01ehr01qjg136mv40cvu01ehr01qjg136mv4g")
+ALPHA_VANTAGE_API_KEY = os.getenv("ALPHA_VANTAGE_API_KEY", "HCNAPMP7ZWYFT3YO")
 MISTRAL_MODEL = "mistral-tiny"
 
 # Initialize Mistral client
