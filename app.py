@@ -12,21 +12,30 @@ from functools import lru_cache
 
 app = Flask(__name__)
 
-# Enhanced CORS Configuration
+# Enhanced CORS Configuration for local development
 CORS(app, 
-     origins=["https://finance-bot-frontend.vercel.app", "http://localhost:3000", "http://127.0.0.1:3000"], 
+     origins=["http://localhost:3000", "http://127.0.0.1:3000", "http://localhost:3001", "http://127.0.0.1:5000"], 
      methods=["GET","POST","OPTIONS"], 
      allow_headers=["Content-Type","Authorization"], 
      supports_credentials=True)
 
-# API Configuration
-MISTRAL_API_KEY = os.getenv("MISTRAL_API_KEY", "QKIr9flpqitrfwPJP1PsVf83I03jUUdd")
-FINNHUB_API_KEY = os.getenv("FINNHUB_API_KEY", "cvu01ehr01qjg136mv40cvu01ehr01qjg136mv4g")
-ALPHA_VANTAGE_API_KEY = os.getenv("ALPHA_VANTAGE_API_KEY", "HCNAPMP7ZWYFT3YO")
+# API Configuration - Load from environment variables
+MISTRAL_API_KEY = os.getenv("MISTRAL_API_KEY")
+FINNHUB_API_KEY = os.getenv("FINNHUB_API_KEY", "")
+ALPHA_VANTAGE_API_KEY = os.getenv("ALPHA_VANTAGE_API_KEY", "")
 MISTRAL_MODEL = "mistral-tiny"
 
-# Initialize Mistral client
-client = Mistral(api_key=MISTRAL_API_KEY)
+# Check if Mistral API key is available
+if not MISTRAL_API_KEY:
+    print("⚠️  WARNING: MISTRAL_API_KEY not found in environment variables")
+    print("   Please set your Mistral API key using:")
+    print("   export MISTRAL_API_KEY='your_api_key_here'")
+    print("   The app will run in demo mode with limited functionality.")
+    DEMO_MODE = True
+else:
+    DEMO_MODE = False
+    # Initialize Mistral client
+    client = Mistral(api_key=MISTRAL_API_KEY)
 
 # Cache for financial data to avoid excessive API calls
 financial_cache = {}
@@ -252,6 +261,9 @@ def validate_user_input(user_input):
 
 def call_mistral_api(messages, temperature=0.7, max_tokens=800, max_retries=3):
     """Make a call to the Mistral API with retry logic"""
+    if DEMO_MODE:
+        return {"error": "Demo mode - Mistral API not available"}
+    
     retry_delay = 1
     
     for attempt in range(max_retries):
@@ -304,10 +316,12 @@ def enhance_message_with_financial_data(user_input):
 @app.route('/')
 def home():
     return jsonify({
-        "status": "FinanceGuru Backend Running",
-        "version": "2.0",
+        "status": "FinanceGuru Backend Running Locally",
+        "version": "2.0-local",
+        "demo_mode": DEMO_MODE,
         "features": ["Real-time stock data", "Crypto prices", "Personalized advice", "Market analysis"],
-        "endpoints": ["/api/chat", "/api/finance/quote/<symbol>", "/api/finance/crypto/<symbol>", "/api/health"]
+        "endpoints": ["/api/chat", "/api/finance/quote/<symbol>", "/api/finance/crypto/<symbol>", "/api/health"],
+        "setup_note": "Set MISTRAL_API_KEY environment variable for full functionality"
     })
 
 @app.route('/api/finance/quote/<symbol>')
@@ -373,20 +387,28 @@ def chat():
         # Handle short inputs
         if len(user_input.strip()) < 5:
             if user_input.lower().strip() in ["hi", "hello", "hey"]:
+                welcome_msg = "Hello! I'm your AI financial advisor with access to real-time market data. I can help you with investment planning, stock analysis, and personalized financial advice."
+                if DEMO_MODE:
+                    welcome_msg += " (Currently running in demo mode - some AI features may be limited)"
+                welcome_msg += " What would you like to know?"
+                
                 if len(conversation_history) == 0:
                     return jsonify({
-                        "response": "Hello! I'm your AI financial advisor with access to real-time market data. I can help you with investment planning, stock analysis, and personalized financial advice. What would you like to know?",
-                        "user_id": user_id
+                        "response": welcome_msg,
+                        "user_id": user_id,
+                        "demo_mode": DEMO_MODE
                     })
                 else:
                     return jsonify({
                         "response": "Hi there! Do you have any financial questions or want to check on specific stocks?",
-                        "user_id": user_id
+                        "user_id": user_id,
+                        "demo_mode": DEMO_MODE
                     })
             
             return jsonify({
                 "response": "Could you provide more details so I can better assist with your financial planning?",
-                "user_id": user_id
+                "user_id": user_id,
+                "demo_mode": DEMO_MODE
             })
         
         # Validate input
@@ -395,7 +417,8 @@ def chat():
             return jsonify({
                 "response": validation_message,
                 "user_id": user_id,
-                "validated": False
+                "validated": False,
+                "demo_mode": DEMO_MODE
             })
         
         # Enhance message with real-time financial data
@@ -419,7 +442,7 @@ def chat():
         # Add current user input
         messages.append({"role": "user", "content": user_input})
         
-        # Call Mistral API
+        # Call Mistral API or use fallback
         response = call_mistral_api(messages)
         
         if isinstance(response, dict) and "error" in response:
@@ -427,7 +450,9 @@ def chat():
             return jsonify({
                 "response": fallback_response,
                 "user_id": user_id,
-                "error": response["error"]
+                "error": response["error"],
+                "demo_mode": DEMO_MODE,
+                "fallback_used": True
             })
         
         response_text = response.choices[0].message.content.strip()
@@ -443,14 +468,21 @@ def chat():
         return jsonify({
             "response": response_text,
             "user_id": user_id,
-            "market_data_included": bool(financial_context)
+            "market_data_included": bool(financial_context),
+            "demo_mode": DEMO_MODE
         })
         
     except Exception as e:
+        fallback_msg = "I'm experiencing technical difficulties, but I can still help with basic financial information and stock data."
+        if 'data' in locals() and financial_context:
+            fallback_msg += f" Here's the market data you requested:\n{financial_context}"
+        
         return jsonify({
-            "response": "I'm experiencing technical difficulties. Please try asking about a specific stock or financial topic.",
+            "response": fallback_msg,
             "user_id": data.get('user_id', 'anonymous') if 'data' in locals() else 'anonymous',
-            "error": str(e)
+            "error": str(e),
+            "demo_mode": DEMO_MODE,
+            "fallback_used": True
         })
 
 @app.route('/api/health', methods=['GET'])
@@ -458,7 +490,10 @@ def health_check():
     """Enhanced health check with financial data sources"""
     try:
         # Test Mistral API
-        mistral_status = "connected" if MISTRAL_API_KEY and len(MISTRAL_API_KEY) > 10 else "error: Invalid API key"
+        if DEMO_MODE:
+            mistral_status = "demo mode - API key not provided"
+        else:
+            mistral_status = "connected" if MISTRAL_API_KEY and len(MISTRAL_API_KEY) > 10 else "error: Invalid API key"
         
         # Test financial data
         try:
@@ -467,7 +502,7 @@ def health_check():
         except Exception as e:
             yfinance_status = f"error: {str(e)}"
         
-        overall_status = "ok" if mistral_status == "connected" and "error" not in yfinance_status else "degraded"
+        overall_status = "ok" if (mistral_status == "connected" or DEMO_MODE) and "error" not in yfinance_status else "degraded"
         
         return jsonify({
             "status": overall_status,
@@ -475,6 +510,8 @@ def health_check():
             "yfinance": yfinance_status,
             "model": MISTRAL_MODEL,
             "cache_size": len(financial_client.cache),
+            "demo_mode": DEMO_MODE,
+            "environment": "local",
             "timestamp": datetime.now().isoformat()
         })
         
@@ -482,6 +519,7 @@ def health_check():
         return jsonify({
             "status": "error",
             "error": str(e),
+            "demo_mode": DEMO_MODE,
             "timestamp": datetime.now().isoformat()
         })
 
@@ -496,7 +534,12 @@ def get_enhanced_fallback_response(user_input, financial_context=""):
     # Extract mentioned stocks
     stock_symbols = extract_stock_symbols(user_input)
     
-    response_parts = ["I'm currently having trouble accessing my full advisory system, but I can still help you!"]
+    response_parts = []
+    
+    if DEMO_MODE:
+        response_parts.append("I'm running in demo mode (Mistral API not configured), but I can still provide financial guidance and real-time market data!")
+    else:
+        response_parts.append("I'm currently having trouble accessing my full advisory system, but I can still help you!")
     
     # Include real-time data if available
     if financial_context:
@@ -522,8 +565,15 @@ def get_enhanced_fallback_response(user_input, financial_context=""):
     return " ".join(response_parts)
 
 if __name__ == "__main__":
-    print("🚀 Starting Enhanced FinanceGuru Backend")
+    print("🚀 Starting FinanceGuru Backend (Local Development)")
     print("📊 Features: Real-time stock data, crypto prices, market analysis")
-    print(f"🤖 AI Model: {MISTRAL_MODEL}")
+    if DEMO_MODE:
+        print("⚠️  Running in DEMO MODE - Set MISTRAL_API_KEY for full functionality")
+        print("   Get your API key from: https://console.mistral.ai/")
+        print("   Then run: export MISTRAL_API_KEY='your_api_key_here'")
+    else:
+        print(f"🤖 AI Model: {MISTRAL_MODEL}")
     print("🔥 Financial Data: yfinance integration")
-    app.run(debug=True, host='0.0.0.0', port=5000)
+    print("🌐 Server running on: http://localhost:5000")
+    print("📡 CORS enabled for local development")
+    app.run(debug=True, host='127.0.0.1', port=5000)
