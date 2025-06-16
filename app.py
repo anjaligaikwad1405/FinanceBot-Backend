@@ -1,532 +1,529 @@
 import os
 import time
+import re
+import json
+from datetime import datetime, timedelta
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from mistralai import Mistral
+import yfinance as yf
+import requests
+from functools import lru_cache
 
 app = Flask(__name__)
 
-# 🧩 STEP 1: Updated CORS Configuration
-# Replace "https://your-frontend-name.vercel.app" with your actual Vercel URL
+# Enhanced CORS Configuration
 CORS(app, 
-     origins=["https://finance-bot-frontend.vercel.app", "https://finance-bot-frontend.vercel.app/"], 
+     origins=["https://finance-bot-frontend.vercel.app", "http://localhost:3000", "http://127.0.0.1:3000"], 
      methods=["GET","POST","OPTIONS"], 
      allow_headers=["Content-Type","Authorization"], 
      supports_credentials=True)
 
-# Mistral API Configuration
-MISTRAL_API_KEY = "QKIr9flpqitrfwPJP1PsVf83I03jUUdd" # Replace with your actual API key or use environment variable
-MISTRAL_MODEL = "mistral-tiny"  # Using Mistral-tiny model for testing
+# API Configuration
+MISTRAL_API_KEY = os.getenv("MISTRAL_API_KEY", "QKIr9flpqitrfwPJP1PsVf83I03jUUdd")
+FINNHUB_API_KEY = os.getenv("FINNHUB_API_KEY", "")
+ALPHA_VANTAGE_API_KEY = os.getenv("ALPHA_VANTAGE_API_KEY", "")
+MISTRAL_MODEL = "mistral-tiny"
 
 # Initialize Mistral client
 client = Mistral(api_key=MISTRAL_API_KEY)
 
+# Cache for financial data to avoid excessive API calls
+financial_cache = {}
+CACHE_DURATION = 300  # 5 minutes
+
 DEFAULT_SYSTEM_MESSAGE = """
-You are a personal financial AI assistant. Your job is to understand and extract user details such as age, job, investment amount, and investment purpose from natural conversations.
+You are a sophisticated personal financial AI assistant with access to real-time market data. Your job is to:
+
+1. Understand user financial goals, risk tolerance, investment timeline, and personal details
+2. Provide personalized investment advice based on current market conditions
+3. Integrate real-time stock prices, market data, and financial metrics into your responses
+4. Offer actionable, practical financial guidance
 
 CONVERSATION RULES:
-- NEVER start your responses with "Welcome to FinanceGuru" unless explicitly instructed
-- Do NOT ask for all user details at once if they're just asking a general question
-- If a user asks a general finance question, provide helpful information immediately without requiring personal details
-- Only ask for specific personal details if they're relevant to giving personalized advice
-- Maintain conversation context - don't repeat questions the user has already answered
+- NEVER start responses with "Welcome to FinanceGuru" unless it's the first interaction
+- Provide immediate value - don't gatekeep information behind personal details
+- Ask for personal details only when needed for personalized advice
+- Use real-time data when discussing specific stocks, ETFs, or market conditions
+- Maintain conversation context and avoid repetitive questions
 
 INPUT VALIDATION RULES:
-- MANDATORY: Check if the user provides unrealistic information (e.g., claiming to be 300 years old)
-- NEVER provide financial advice based on impossible or clearly joking inputs
-- If the user provides unrealistic information, politely ask for clarification
-- Realistic age range for financial advice is 5-120 years old ONLY
-- NEVER accept ages over 120 or under 5 years old - always ask for clarification
-- Realistic investment amounts should be appropriate to the context (not extremely small or large)
-- If a user states an impossible age (like 1000 years), first acknowledge it as unrealistic then ask for their actual age
+- Reject unrealistic ages (outside 5-120 years)
+- Question impossibly large investment amounts
+- Politely correct obviously false information
+- Ask for clarification when inputs seem unrealistic
 
-When providing financial advice:
-- If sufficient information is present for personalized advice, provide a tailored investment plan
-- Investment plans should include percentages across various instruments based on age group:
-  - Up to 30: high risk, high return
-  - 31–50: moderate risk
-  - 51 and above: low risk
-- Always keep financial advice focused, clear, and jargon-free
-- Respond in a warm, advisory tone
+REAL-TIME DATA INTEGRATION:
+- When users mention specific stocks (e.g., AAPL, TSLA), include current price and key metrics
+- Provide context about market conditions when giving advice
+- Use actual performance data to support recommendations
+- Include relevant financial ratios and indicators
+
+INVESTMENT ADVICE FRAMEWORK:
+- Ages 18-30: 70-90% stocks, 10-30% bonds/alternatives
+- Ages 31-50: 60-80% stocks, 20-40% bonds/alternatives  
+- Ages 51+: 40-70% stocks, 30-60% bonds/alternatives
+- Adjust based on risk tolerance and goals
 """
 
+class FinancialDataClient:
+    """Unified client for fetching financial data from multiple sources"""
+    
+    def __init__(self):
+        self.cache = {}
+        self.cache_duration = CACHE_DURATION
+    
+    def _is_cache_valid(self, key):
+        """Check if cached data is still valid"""
+        if key not in self.cache:
+            return False
+        cache_time = self.cache[key].get('timestamp', 0)
+        return (time.time() - cache_time) < self.cache_duration
+    
+    def _cache_data(self, key, data):
+        """Cache data with timestamp"""
+        self.cache[key] = {
+            'data': data,
+            'timestamp': time.time()
+        }
+    
+    def get_stock_data(self, symbol):
+        """Get comprehensive stock data using yfinance"""
+        cache_key = f"stock_{symbol.upper()}"
+        
+        if self._is_cache_valid(cache_key):
+            return self.cache[cache_key]['data']
+        
+        try:
+            ticker = yf.Ticker(symbol.upper())
+            info = ticker.info
+            hist = ticker.history(period="1d")
+            
+            if hist.empty:
+                return {"error": f"No data found for symbol {symbol}"}
+            
+            current_price = hist['Close'].iloc[-1]
+            prev_close = info.get('previousClose', current_price)
+            change = current_price - prev_close
+            percent_change = (change / prev_close) * 100 if prev_close != 0 else 0
+            
+            data = {
+                "symbol": symbol.upper(),
+                "name": info.get('longName', 'N/A'),
+                "current_price": round(current_price, 2),
+                "previous_close": round(prev_close, 2),
+                "change": round(change, 2),
+                "percent_change": round(percent_change, 2),
+                "volume": info.get('volume', 0),
+                "market_cap": info.get('marketCap', 0),
+                "pe_ratio": info.get('trailingPE', 'N/A'),
+                "dividend_yield": info.get('dividendYield', 0),
+                "52_week_high": info.get('fiftyTwoWeekHigh', 0),
+                "52_week_low": info.get('fiftyTwoWeekLow', 0),
+                "sector": info.get('sector', 'N/A'),
+                "industry": info.get('industry', 'N/A'),
+                "source": "yfinance",
+                "timestamp": datetime.now().isoformat()
+            }
+            
+            self._cache_data(cache_key, data)
+            return data
+            
+        except Exception as e:
+            return {"error": f"Failed to fetch data for {symbol}: {str(e)}"}
+    
+    def get_crypto_data(self, symbol):
+        """Get cryptocurrency data"""
+        cache_key = f"crypto_{symbol.upper()}"
+        
+        if self._is_cache_valid(cache_key):
+            return self.cache[cache_key]['data']
+        
+        try:
+            # Use yfinance for crypto (e.g., BTC-USD, ETH-USD)
+            crypto_symbol = f"{symbol.upper()}-USD"
+            ticker = yf.Ticker(crypto_symbol)
+            hist = ticker.history(period="1d")
+            
+            if hist.empty:
+                return {"error": f"No crypto data found for {symbol}"}
+            
+            current_price = hist['Close'].iloc[-1]
+            prev_close = hist['Open'].iloc[0]
+            change = current_price - prev_close
+            percent_change = (change / prev_close) * 100 if prev_close != 0 else 0
+            
+            data = {
+                "symbol": symbol.upper(),
+                "current_price": round(current_price, 2),
+                "change": round(change, 2),
+                "percent_change": round(percent_change, 2),
+                "volume": hist['Volume'].iloc[-1] if not hist.empty else 0,
+                "source": "yfinance_crypto",
+                "timestamp": datetime.now().isoformat()
+            }
+            
+            self._cache_data(cache_key, data)
+            return data
+            
+        except Exception as e:
+            return {"error": f"Failed to fetch crypto data for {symbol}: {str(e)}"}
+    
+    def search_stocks(self, query):
+        """Search for stocks by name or symbol"""
+        try:
+            # Simple search using yfinance
+            search_symbols = [query.upper(), f"{query}.NS", f"{query}.BO"]  # Include Indian markets
+            results = []
+            
+            for symbol in search_symbols:
+                try:
+                    ticker = yf.Ticker(symbol)
+                    info = ticker.info
+                    if info.get('longName') or info.get('shortName'):
+                        results.append({
+                            "symbol": symbol,
+                            "name": info.get('longName', info.get('shortName', 'N/A')),
+                            "sector": info.get('sector', 'N/A')
+                        })
+                except:
+                    continue
+            
+            return {"results": results[:5]}  # Limit to 5 results
+            
+        except Exception as e:
+            return {"error": f"Search failed: {str(e)}"}
+
+# Initialize financial data client
+financial_client = FinancialDataClient()
+
+def extract_stock_symbols(text):
+    """Extract potential stock symbols from text"""
+    # Common patterns for stock symbols
+    patterns = [
+        r'\b[A-Z]{1,5}\b',  # 1-5 uppercase letters
+        r'\$([A-Z]{1,5})\b',  # $AAPL format
+        r'\b([A-Z]{1,5})\.NS\b',  # Indian NSE format
+        r'\b([A-Z]{1,5})\.BO\b',  # Indian BSE format
+    ]
+    
+    symbols = set()
+    for pattern in patterns:
+        matches = re.findall(pattern, text.upper())
+        symbols.update(matches if isinstance(matches[0], str) if matches else [] for match in matches)
+    
+    # Filter out common words that might match the pattern
+    common_words = {'THE', 'AND', 'FOR', 'ARE', 'BUT', 'NOT', 'YOU', 'ALL', 'CAN', 'HER', 'WAS', 'ONE', 'OUR', 'HAD', 'BUT', 'WHAT', 'WERE', 'THEY', 'WE', 'BEEN', 'HAVE', 'THEIR', 'WHERE', 'WHO', 'OIL', 'GAS', 'CAR', 'NEW', 'OLD', 'BIG', 'GET', 'USE', 'MAN', 'DAY', 'TOO', 'ANY', 'MAY', 'SAY', 'SHE', 'ITS', 'HOW', 'TWO', 'WHO', 'BOY', 'DID', 'HAS', 'LET', 'PUT', 'END', 'WHY', 'TRY', 'GOD', 'SIX', 'DOG', 'EAT', 'AGO', 'SIT', 'FUN', 'BAD', 'YES', 'YET', 'ARM', 'FAR', 'OFF', 'BAG', 'BED', 'BET', 'BOX', 'BOY', 'BUS', 'BUY', 'CAN', 'CAR', 'CAT', 'CUP', 'CUT', 'DAD', 'DAY', 'DID', 'DOG', 'EAR', 'EAT', 'EGG', 'END', 'EYE', 'FAR', 'FED', 'FEW', 'FIX', 'FLY', 'FOR', 'FOX', 'FUN', 'GET', 'GOD', 'GOT', 'GUN', 'HAD', 'HAM', 'HAS', 'HAT', 'HER', 'HIM', 'HIS', 'HIT', 'HOT', 'HOW', 'HUG', 'ICE', 'ILL', 'JAM', 'JOB', 'JOY', 'KEY', 'KID', 'LAP', 'LAY', 'LEG', 'LET', 'LID', 'LIE', 'LOG', 'LOT', 'LOW', 'MAD', 'MAN', 'MAP', 'MAY', 'MOM', 'MUD', 'NET', 'NEW', 'NOD', 'NOT', 'NOW', 'NUT', 'ODD', 'OFF', 'OLD', 'ONE', 'OUR', 'OUT', 'OWN', 'PAD', 'PAN', 'PAY', 'PEN', 'PET', 'PIE', 'PIG', 'POT', 'PUT', 'RAN', 'RAT', 'RAW', 'RED', 'RID', 'RIP', 'ROW', 'RUB', 'RUG', 'RUN', 'SAD', 'SAT', 'SAW', 'SAY', 'SEA', 'SEE', 'SET', 'SHE', 'SIT', 'SIX', 'SKY', 'SON', 'SUN', 'TAX', 'TEA', 'TEN', 'THE', 'TIE', 'TIP', 'TOO', 'TOP', 'TOY', 'TRY', 'TWO', 'USE', 'VAN', 'WAR', 'WAS', 'WAY', 'WE', 'WET', 'WHO', 'WHY', 'WIN', 'WON', 'YES', 'YET', 'YOU', 'ZIP'}
+    
+    return [s for s in symbols if s not in common_words and len(s) >= 2]
+
 def validate_user_input(user_input):
-    """
-    Validate user input for unrealistic values (age, investment amount, etc.)
-    Returns a tuple: (is_valid, validation_message)
-    """
-    # Convert to lowercase for easier matching
+    """Validate user input for unrealistic values"""
     lowercase_input = user_input.lower()
     
     # Check for unrealistic age
-    age_words = ["i am", "i'm", "age", "years old"]
-    for age_word in age_words:
-        if age_word in lowercase_input:
-            parts = lowercase_input.split(age_word)
-            if len(parts) > 1:
-                # Try to extract the age number
-                try:
-                    words = parts[1].strip().split()
-                    for word in words[:2]:  # Look at first two words after age phrase
-                        if word.isdigit():
-                            age = int(word)
-                            # Check if age is unrealistic
-                            if age > 120:
-                                return (False, f"I noticed you mentioned being {age} years old, which seems unrealistic for financial planning. Could you please confirm your actual age so I can provide more accurate advice?")
-                            elif age < 5:
-                                return (False, f"I noticed you mentioned being {age} years old, which is quite young for independent financial planning. Are you asking on behalf of someone else?")
-                except:
-                    pass
+    age_patterns = [r'i am (\d+)', r"i'm (\d+)", r'age (\d+)', r'(\d+) years old']
+    for pattern in age_patterns:
+        matches = re.findall(pattern, lowercase_input)
+        for match in matches:
+            try:
+                age = int(match)
+                if age > 120:
+                    return (False, f"I noticed you mentioned being {age} years old. For accurate financial planning, could you please confirm your actual age?")
+                elif age < 5:
+                    return (False, f"Financial planning for someone {age} years old typically involves parents or guardians. Are you planning on behalf of someone else?")
+            except ValueError:
+                continue
     
     # Check for unrealistic investment amounts
-    amount_indicators = ["invest", "investing", "investment", "rs", "rupees", "inr", "$", "dollars", "usd"]
-    for indicator in amount_indicators:
-        if indicator in lowercase_input:
-            # Look for extremely large numbers
-            parts = lowercase_input.split(indicator)
-            for part in parts:
-                words = part.strip().split()
-                for i, word in enumerate(words):
-                    # Clean the word of non-numeric characters
-                    clean_word = ''.join(c for c in word if c.isdigit() or c == '.')
-                    if clean_word and clean_word.replace('.', '', 1).isdigit():
-                        try:
-                            amount = float(clean_word)
-                            # Check if next word might be "billion", "trillion", etc.
-                            if i < len(words) - 1:
-                                multiplier_word = words[i+1].lower()
-                                if "trillion" in multiplier_word:
-                                    return (False, f"I noticed you mentioned investing trillions, which is an extremely large amount. Could you please confirm a more realistic investment amount for personalized advice?")
-                                elif "billion" in multiplier_word and amount > 1:
-                                    return (False, f"I noticed you mentioned investing billions, which is an extremely large amount. Could you please confirm a more realistic investment amount for personalized advice?")
-                        except:
-                            pass
+    amount_patterns = [r'invest (\d+(?:\.\d+)?)\s*(trillion|billion|million|lakh|crore)', 
+                      r'(\d+(?:\.\d+)?)\s*(trillion|billion|million|lakh|crore)']
+    for pattern in amount_patterns:
+        matches = re.findall(pattern, lowercase_input)
+        for amount_str, unit in matches:
+            try:
+                amount = float(amount_str)
+                if unit == 'trillion' or (unit == 'billion' and amount > 10):
+                    return (False, "I noticed you mentioned an extremely large investment amount. Could you please confirm a more realistic figure for personalized advice?")
+            except ValueError:
+                continue
     
-    # If all checks pass, input is considered valid
     return (True, None)
 
-def call_mistral_api(messages, temperature=0.7, max_tokens=800, max_retries=5):
-    """Make a call to the Mistral API using client library with retry logic"""
-    retry_delay = 1  # Start with a 1-second delay
+def call_mistral_api(messages, temperature=0.7, max_tokens=800, max_retries=3):
+    """Make a call to the Mistral API with retry logic"""
+    retry_delay = 1
     
     for attempt in range(max_retries):
         try:
-            print(f"Attempt {attempt+1}/{max_retries} - Sending request to Mistral API")
-            
-            # Call the API with the current SDK syntax
             response = client.chat.complete(
                 model=MISTRAL_MODEL,
                 messages=messages,
                 temperature=temperature,
                 max_tokens=max_tokens
             )
-            
-            print(f"Received response from Mistral API successfully")
             return response
             
         except Exception as e:
             error_str = str(e)
-            print(f"Exception when calling Mistral API: {error_str}")
-            
-            # Check if it's a rate limit error
             if "429" in error_str or "rate limit" in error_str.lower():
-                if attempt < max_retries - 1:  # Don't wait after the last attempt
-                    print(f"Rate limit exceeded. Retrying in {retry_delay} seconds...")
+                if attempt < max_retries - 1:
                     time.sleep(retry_delay)
-                    retry_delay *= 2  # Exponential backoff
+                    retry_delay *= 2
                 else:
-                    print(f"Maximum retries reached. Giving up.")
+                    break
             else:
-                # If it's not a rate limit error, don't retry
-                return {"error": f"API error occurred: {error_str}"}
+                return {"error": f"API error: {error_str}"}
     
-    return {"error": "Maximum retry attempts exceeded due to rate limiting."}
+    return {"error": "Maximum retry attempts exceeded"}
 
-def analyze_sentiment(text, max_retries=3):
-    """Analyze sentiment of financial text using Mistral API with retry logic"""
-    messages = [
-        {"role": "system", "content": "You are a financial sentiment analysis assistant."},
-        {"role": "user", "content": f"What is the sentiment of this financial text? Please respond with only one word: negative, neutral, or positive.\n\nText: {text}"}
-    ]
+def enhance_message_with_financial_data(user_input):
+    """Enhance user message with real-time financial data"""
+    stock_symbols = extract_stock_symbols(user_input)
+    financial_context = ""
     
-    try:
-        result = call_mistral_api(messages, temperature=0.1, max_tokens=50, max_retries=max_retries)
-        
-        # Check if we got a proper response object
-        if isinstance(result, dict) and "error" in result:
-            print(f"Error in sentiment analysis: {result['error']}")
-            return {"sentiment": "neutral", "input_text": text, "error": result["error"]}
-            
-        sentiment_response = result.choices[0].message.content.strip().lower()
-        
-        # Extract just the sentiment word
-        if "negative" in sentiment_response:
-            sentiment = "negative"
-        elif "positive" in sentiment_response:
-            sentiment = "positive"
-        elif "neutral" in sentiment_response:
-            sentiment = "neutral"
-        else:
-            sentiment = "unknown"
-            
-        return {"sentiment": sentiment, "input_text": text}
-            
-    except Exception as e:
-        print(f"Sentiment analysis error: {str(e)}")
-        return {"sentiment": "neutral", "input_text": text, "error": str(e)}
+    if stock_symbols:
+        financial_context += "\n\nREAL-TIME MARKET DATA:\n"
+        for symbol in stock_symbols[:3]:  # Limit to 3 symbols to avoid context overflow
+            stock_data = financial_client.get_stock_data(symbol)
+            if 'error' not in stock_data:
+                financial_context += f"{symbol}: ${stock_data['current_price']} ({stock_data['change']:+.2f}, {stock_data['percent_change']:+.2f}%) - {stock_data['name']}\n"
+    
+    # Check for crypto mentions
+    crypto_keywords = ['bitcoin', 'btc', 'ethereum', 'eth', 'crypto', 'cryptocurrency']
+    mentioned_crypto = [kw for kw in crypto_keywords if kw in user_input.lower()]
+    
+    if mentioned_crypto and 'bitcoin' in mentioned_crypto or 'btc' in mentioned_crypto:
+        crypto_data = financial_client.get_crypto_data('BTC')
+        if 'error' not in crypto_data:
+            financial_context += f"Bitcoin: ${crypto_data['current_price']} ({crypto_data['change']:+.2f}, {crypto_data['percent_change']:+.2f}%)\n"
+    
+    return financial_context
 
-def get_financial_advice(user_input, sentiment_result=None, max_retries=3):
-    """Generate financial advice using Mistral API with retry logic"""
-    system_prompt = DEFAULT_SYSTEM_MESSAGE
-    
-    # Add sentiment analysis result if available
-    if sentiment_result and "sentiment" in sentiment_result:
-        system_prompt += f"\n\nSentiment analysis of user's query: {sentiment_result['sentiment']}"
-    
-    messages = [
-        {"role": "system", "content": system_prompt},
-        {"role": "user", "content": user_input}
-    ]
-    
-    try:
-        result = call_mistral_api(messages, temperature=0.7, max_tokens=800, max_retries=max_retries)
-        
-        # Check for proper response object
-        if isinstance(result, dict) and "error" in result:
-            print(f"Error in financial advice: {result['error']}")
-            return f"I'm having technical difficulties: {result['error']}. Can you ask a simple financial question instead?"
-            
-        return result.choices[0].message.content.strip()
-            
-    except Exception as e:
-        print(f"Error generating financial advice: {str(e)}")
-        return "I'm having trouble connecting to our financial database. How about you ask me about basic investment strategies instead?"
-
-# 🧩 STEP 1 CONTINUED: Add root route to avoid "Not Found" errors
+# API Routes
 @app.route('/')
 def home():
-    return "Backend is running!"
+    return jsonify({
+        "status": "FinanceGuru Backend Running",
+        "version": "2.0",
+        "features": ["Real-time stock data", "Crypto prices", "Personalized advice", "Market analysis"],
+        "endpoints": ["/api/chat", "/api/finance/quote/<symbol>", "/api/finance/crypto/<symbol>", "/api/health"]
+    })
 
-@app.route('/api/sentiment', methods=['POST'])
-def analyze_sentiment_api():
-    """API endpoint for sentiment analysis"""
-    data = request.json
-    text = data.get('text', '')
+@app.route('/api/finance/quote/<symbol>')
+def get_stock_quote(symbol):
+    """Get real-time stock quote"""
+    data = financial_client.get_stock_data(symbol)
+    return jsonify(data)
+
+@app.route('/api/finance/crypto/<symbol>')
+def get_crypto_quote(symbol):
+    """Get cryptocurrency quote"""
+    data = financial_client.get_crypto_data(symbol)
+    return jsonify(data)
+
+@app.route('/api/finance/search')
+def search_stocks():
+    """Search for stocks"""
+    query = request.args.get('q', '')
+    if not query:
+        return jsonify({"error": "Please provide search query"}), 400
     
-    if not text:
-        return jsonify({"error": "Please provide text for analysis"}), 400
-    
-    result = analyze_sentiment(text)
-    return jsonify(result)
+    data = financial_client.search_stocks(query)
+    return jsonify(data)
+
+@app.route('/api/finance/market-status')
+def market_status():
+    """Get market status"""
+    try:
+        # Get major indices
+        indices = ['SPY', 'QQQ', 'DIA']  # S&P 500, NASDAQ, Dow
+        market_data = {}
+        
+        for index in indices:
+            data = financial_client.get_stock_data(index)
+            if 'error' not in data:
+                market_data[index] = {
+                    "price": data['current_price'],
+                    "change": data['change'],
+                    "percent_change": data['percent_change']
+                }
+        
+        return jsonify({
+            "status": "open" if datetime.now().weekday() < 5 else "closed",
+            "indices": market_data,
+            "timestamp": datetime.now().isoformat()
+        })
+        
+    except Exception as e:
+        return jsonify({"error": str(e)})
 
 @app.route('/api/chat', methods=['POST'])
 def chat():
-    """API endpoint for chat with financial advisor - improved with conversation memory and input validation"""
+    """Enhanced chat endpoint with real-time financial data integration"""
     try:
         data = request.json
         user_input = data.get('user_input', '')
         user_id = data.get('user_id', 'anonymous')
         conversation_history = data.get('conversation_history', [])
         
-        print(f"Received chat request: {user_input}")
-        print(f"Conversation history length: {len(conversation_history)}")
-        
         if not user_input:
             return jsonify({"error": "Please provide user input"}), 400
         
-        # Handle extremely short inputs more intelligently
+        # Handle short inputs
         if len(user_input.strip()) < 5:
-            lowercase_input = user_input.lower().strip()
+            if user_input.lower().strip() in ["hi", "hello", "hey"]:
+                if len(conversation_history) == 0:
+                    return jsonify({
+                        "response": "Hello! I'm your AI financial advisor with access to real-time market data. I can help you with investment planning, stock analysis, and personalized financial advice. What would you like to know?",
+                        "user_id": user_id
+                    })
+                else:
+                    return jsonify({
+                        "response": "Hi there! Do you have any financial questions or want to check on specific stocks?",
+                        "user_id": user_id
+                    })
             
-            # If it's the first message and it's a greeting
-            if len(conversation_history) == 0 and lowercase_input in ["hi", "hello", "hey", "hii"]:
-                return jsonify({
-                    "response": "Welcome to FinanceGuru, your personalized financial planning assistant. How can I help with your financial planning today?",
-                    "user_id": user_id
-                })
-            
-            # If it's not the first message or not a greeting
-            if lowercase_input in ["hi", "hello", "hey", "hii"]:
-                return jsonify({
-                    "response": "Hello again! Do you have any specific financial questions I can help with?",
-                    "user_id": user_id
-                })
-            
-            # For other short inputs, ask for more context
             return jsonify({
                 "response": "Could you provide more details so I can better assist with your financial planning?",
                 "user_id": user_id
             })
         
-        # Validate the user input before calling the API
+        # Validate input
         is_valid, validation_message = validate_user_input(user_input)
-        
         if not is_valid:
-            # Return the validation message directly without calling the LLM API
             return jsonify({
                 "response": validation_message,
                 "user_id": user_id,
                 "validated": False
             })
         
-        # Build messages including conversation history
-        messages = [
-            {"role": "system", "content": DEFAULT_SYSTEM_MESSAGE + """
-            ADDITIONAL VALIDATION RULES:
-            - You MUST reject any claim of age over 120 years or under 5 years old
-            - Do NOT provide financial advice to users claiming impossible ages
-            - If a user claims to be 1000 years old, 500 years old, etc., politely ask for their actual age
-            - Be suspicious of extremely large investment amounts (billions or trillions)
-            - Never give financial advice based on clearly joking or impossible inputs
-            """}
-        ]
+        # Enhance message with real-time financial data
+        financial_context = enhance_message_with_financial_data(user_input)
         
-        # Add conversation history
-        # Limit to last 5 exchanges to stay within context limits
-        max_history = 5
-        for exchange in conversation_history[-max_history:]:
-            if "user_message" in exchange and exchange["user_message"]:
+        # Build enhanced system message
+        enhanced_system_message = DEFAULT_SYSTEM_MESSAGE
+        if financial_context:
+            enhanced_system_message += f"\n\nCURRENT MARKET CONTEXT:{financial_context}"
+        
+        # Build messages with conversation history
+        messages = [{"role": "system", "content": enhanced_system_message}]
+        
+        # Add conversation history (limit to last 5 exchanges)
+        for exchange in conversation_history[-5:]:
+            if exchange.get("user_message"):
                 messages.append({"role": "user", "content": exchange["user_message"]})
-            if "assistant_message" in exchange and exchange["assistant_message"]:
+            if exchange.get("assistant_message"):
                 messages.append({"role": "assistant", "content": exchange["assistant_message"]})
         
         # Add current user input
         messages.append({"role": "user", "content": user_input})
         
-        # First try API-based response
-        try:
-            # Get financial advice response
-            response = call_mistral_api(messages, temperature=0.7, max_tokens=800, max_retries=3)
-            
-            # Check for proper response object
-            if isinstance(response, dict) and "error" in response:
-                print(f"Error in API response: {response['error']}")
-                fallback_response = get_fallback_response(user_input)
-                return jsonify({
-                    "response": fallback_response,
-                    "user_id": user_id,
-                    "error": response["error"]
-                })
-                
-            response_text = response.choices[0].message.content.strip()
-            print(f"Financial advice response: {response_text}")
-            
-            # Remove any "Welcome to FinanceGuru" text if this isn't the first message
-            if len(conversation_history) > 0 and "welcome to financeguru" in response_text.lower():
-                parts = response_text.lower().split("welcome to financeguru")
-                if len(parts) > 1:
-                    response_text = parts[1].strip()
-                    # Capitalize first letter if needed
-                    if response_text:
-                        response_text = response_text[0].upper() + response_text[1:]
-            
-            # Double-check the response for post-processing validation
-            # Ensure we're not giving advice to someone claiming to be very old
-            if "1000 year" in user_input.lower() or "500 year" in user_input.lower():
-                if "investment plan" in response_text.lower() or "allocation" in response_text.lower():
-                    # Override the response if it appears to be giving financial advice
-                    response_text = "I notice you mentioned an unusual age. To provide you with accurate financial advice, could you please share your actual age? Financial advice should be tailored to realistic life stages and timelines."
-            
-            result = {
-                "response": response_text,
-                "user_id": user_id,
-            }
-            
-            return jsonify(result)
-            
-        except Exception as inner_e:
-            print(f"Inner exception in chat endpoint: {str(inner_e)}")
-            # If API-based response fails, use fallback
-            fallback_response = get_fallback_response(user_input)
+        # Call Mistral API
+        response = call_mistral_api(messages)
+        
+        if isinstance(response, dict) and "error" in response:
+            fallback_response = get_enhanced_fallback_response(user_input, financial_context)
             return jsonify({
                 "response": fallback_response,
                 "user_id": user_id,
-                "error": str(inner_e)
+                "error": response["error"]
             })
-            
-    except Exception as e:
-        print(f"Unhandled exception in chat endpoint: {str(e)}")
+        
+        response_text = response.choices[0].message.content.strip()
+        
+        # Remove redundant welcome messages
+        if len(conversation_history) > 0 and "welcome to financeguru" in response_text.lower():
+            parts = response_text.split("welcome to financeguru", 1)
+            if len(parts) > 1:
+                response_text = parts[1].strip()
+                if response_text:
+                    response_text = response_text[0].upper() + response_text[1:]
+        
         return jsonify({
-            "response": "Sorry, there was a technical issue with our financial system. Please try asking a simpler question about investing or saving.",
+            "response": response_text,
+            "user_id": user_id,
+            "market_data_included": bool(financial_context)
+        })
+        
+    except Exception as e:
+        return jsonify({
+            "response": "I'm experiencing technical difficulties. Please try asking about a specific stock or financial topic.",
             "user_id": data.get('user_id', 'anonymous') if 'data' in locals() else 'anonymous',
             "error": str(e)
         })
 
 @app.route('/api/health', methods=['GET'])
 def health_check():
-    """Health check endpoint with cached responses to avoid excessive API calls"""
+    """Enhanced health check with financial data sources"""
     try:
-        # Test Mistral API connectivity with a simple request
-        messages = [
-            {"role": "system", "content": "You are a helpful assistant."},
-            {"role": "user", "content": "Hello"}
-        ]
+        # Test Mistral API
+        mistral_status = "connected" if MISTRAL_API_KEY and len(MISTRAL_API_KEY) > 10 else "error: Invalid API key"
         
-        # Create a simplified test that doesn't actually call the API
-        # This prevents the health check from consuming your rate limit
-        if MISTRAL_API_KEY != "your_api_key_here" and len(MISTRAL_API_KEY) > 10:
-            api_status = "connected"
-        else:
-            api_status = "error: Invalid API key"
+        # Test financial data
+        try:
+            test_data = financial_client.get_stock_data('AAPL')
+            yfinance_status = "connected" if 'error' not in test_data else f"error: {test_data['error']}"
+        except Exception as e:
+            yfinance_status = f"error: {str(e)}"
         
-        # To actually test the API connection (use sparingly):
-        # result = call_mistral_api(messages, max_tokens=10, max_retries=1)
-        # api_status = "connected" if not isinstance(result, dict) or "error" not in result else f"error: {result.get('error')}"
+        overall_status = "ok" if mistral_status == "connected" and "error" not in yfinance_status else "degraded"
+        
+        return jsonify({
+            "status": overall_status,
+            "mistral_api": mistral_status,
+            "yfinance": yfinance_status,
+            "model": MISTRAL_MODEL,
+            "cache_size": len(financial_client.cache),
+            "timestamp": datetime.now().isoformat()
+        })
         
     except Exception as e:
-        api_status = f"error: {str(e)}"
-        print(f"Health check error: {str(e)}")
-    
-    status_response = {
-        "status": "ok" if api_status == "connected" else "error",
-        "mistral_api_status": api_status,
-        "model": MISTRAL_MODEL
-    }
-    
-    print(f"Health check response: {status_response}")
-    return jsonify(status_response)
+        return jsonify({
+            "status": "error",
+            "error": str(e),
+            "timestamp": datetime.now().isoformat()
+        })
 
-# Enhanced fallback response for when API fails
-def get_fallback_response(user_input):
-    """Provide a relevant fallback response based on user input keywords"""
-    # First validate the input - don't give fallback advice for unrealistic inputs
+def get_enhanced_fallback_response(user_input, financial_context=""):
+    """Enhanced fallback response with financial context"""
     is_valid, validation_message = validate_user_input(user_input)
     if not is_valid:
         return validation_message
-        
-    # Convert to lowercase for easier matching
+    
     lowercase_input = user_input.lower()
     
-    # Extract age if mentioned
-    age = None
-    age_words = ["i am", "i'm", "age", "years old"]
-    for age_word in age_words:
-        if age_word in lowercase_input:
-            parts = lowercase_input.split(age_word)
-            if len(parts) > 1:
-                # Try to extract the age number
-                try:
-                    words = parts[1].strip().split()
-                    for word in words[:2]:  # Look at first two words after age phrase
-                        if word.isdigit():
-                            age = int(word)
-                            break
-                except:
-                    pass
+    # Extract mentioned stocks
+    stock_symbols = extract_stock_symbols(user_input)
     
-    # Check if investment amount is mentioned
-    amount = None
-    amount_indicators = ["invest", "investing", "investment", "rs", "rupees", "inr", "$", "dollars", "usd"]
-    for indicator in amount_indicators:
-        if indicator in lowercase_input:
-            # Look for numbers near the indicator
-            parts = lowercase_input.split(indicator)
-            for part in parts:
-                words = part.strip().split()
-                for i, word in enumerate(words):
-                    # Clean the word of non-numeric characters
-                    clean_word = ''.join(c for c in word if c.isdigit() or c == '.')
-                    if clean_word and clean_word.replace('.', '', 1).isdigit():
-                        try:
-                            amount = float(clean_word)
-                            break
-                        except:
-                            pass
-                    # Check if next word might be "thousand", "k", "lakh", etc.
-                    if clean_word and i < len(words) - 1:
-                        multiplier_word = words[i+1].lower()
-                        multiplier = 1
-                        if "thousand" in multiplier_word or multiplier_word == "k":
-                            multiplier = 1000
-                        elif "lakh" in multiplier_word:
-                            multiplier = 100000
-                        elif "million" in multiplier_word or multiplier_word == "m":
-                            multiplier = 1000000
-                        
-                        if multiplier > 1:
-                            try:
-                                amount = float(clean_word) * multiplier
-                                break
-                            except:
-                                pass
+    response_parts = ["I'm currently having trouble accessing my full advisory system, but I can still help you!"]
     
-    # Check specific financial terms in the input
-    has_retirement = any(term in lowercase_input for term in ["retire", "retirement", "pension", "old age"])
-    has_education = any(term in lowercase_input for term in ["education", "college", "university", "school", "studies", "study"])
-    has_short_term = any(term in lowercase_input for term in ["short term", "short-term", "quick", "emergency", "soon", "trip", "vacation", "holiday"])
-    has_stocks = any(term in lowercase_input for term in ["stock", "equity", "shares"])
-    has_mutual_funds = any(term in lowercase_input for term in ["mutual fund", "etf", "index fund"])
-    has_real_estate = any(term in lowercase_input for term in ["real estate", "property", "house", "apartment", "land"])
-    has_crypto = any(term in lowercase_input for term in ["crypto", "bitcoin", "ethereum", "blockchain"])
+    # Include real-time data if available
+    if financial_context:
+        response_parts.append("Here's the current market data you mentioned:")
+        response_parts.append(financial_context.strip())
     
-    # Determine risk profile based on age if available
-    risk_profile = "moderate"
-    if age is not None:
-        if age <= 30:
-            risk_profile = "aggressive"
-        elif age >= 50:
-            risk_profile = "conservative"
+    # Provide relevant advice based on keywords
+    if any(term in lowercase_input for term in ["retire", "retirement"]):
+        response_parts.append("For retirement planning, consider starting with tax-advantaged accounts like 401(k)s and IRAs, then build a diversified portfolio based on your age and risk tolerance.")
     
-    # Craft a personalized response based on extracted information
-    response_parts = []
+    elif any(term in lowercase_input for term in ["emergency", "emergency fund"]):
+        response_parts.append("An emergency fund should cover 3-6 months of expenses in a high-yield savings account or money market fund for easy access.")
     
-    # Greeting and acknowledgment
-    response_parts.append("Thanks for reaching out to FinanceGuru!")
+    elif stock_symbols:
+        response_parts.append(f"For specific analysis of {', '.join(stock_symbols)}, consider factors like P/E ratio, earnings growth, debt levels, and industry outlook.")
     
-    # Personalization based on extracted info
-    if age is not None:
-        response_parts.append(f"At {age} years old, you're in a good position to start building your financial future.")
+    elif any(term in lowercase_input for term in ["crypto", "bitcoin", "ethereum"]):
+        response_parts.append("Cryptocurrency should be a small portion of your portfolio (typically 5-10%) due to high volatility. Never invest more than you can afford to lose.")
     
-    if amount is not None:
-        currency = "rupees" if "rupee" in lowercase_input or "rs" in lowercase_input or "inr" in lowercase_input else "dollars"
-        response_parts.append(f"Investing {amount} {currency} is a great start.")
+    else:
+        response_parts.append("For general investment advice: diversify across asset classes, invest regularly, keep costs low, and maintain a long-term perspective. Consider your age, risk tolerance, and investment timeline when building your portfolio.")
     
-    # Purpose-specific advice
-    if has_education:
-        response_parts.append("For education funding, consider a mix of fixed deposits and debt mutual funds for near-term goals, and equity funds for longer-term educational aspirations.")
-    
-    if has_retirement:
-        response_parts.append("For retirement planning, start with tax-advantaged retirement accounts and gradually build a diversified portfolio across equity and debt instruments.")
-    
-    if has_short_term:
-        response_parts.append("For short-term goals like trips or emergencies, focus on liquid funds, high-yield savings accounts, or short-term fixed deposits to ensure your money remains accessible.")
-    
-    # Investment vehicle specific advice
-    if has_stocks:
-        if risk_profile == "aggressive":
-            response_parts.append("With your risk profile, allocating 60-70% to quality stocks could be appropriate.")
-        elif risk_profile == "moderate":
-            response_parts.append("Consider allocating 40-50% of your portfolio to quality stocks for growth.")
-        else:
-            response_parts.append("Even with a conservative approach, 20-30% allocation to stable, dividend-paying stocks can help beat inflation.")
-    
-    if has_mutual_funds:
-        response_parts.append("Mutual funds offer diversification and professional management. Index funds are particularly cost-effective for long-term growth.")
-    
-    if has_real_estate:
-        response_parts.append("Real estate investments require significant capital but can provide both rental income and appreciation. REITs (Real Estate Investment Trusts) offer a more accessible alternative.")
-    
-    if has_crypto:
-        response_parts.append("Cryptocurrency investments are highly volatile. If exploring this space, limit exposure to a small percentage of your portfolio that you can afford to lose (typically 5% or less).")
-    
-    # General advice based on risk profile
-    if not (has_stocks or has_mutual_funds or has_real_estate or has_crypto):
-        if risk_profile == "aggressive":
-            response_parts.append("With an aggressive risk profile, consider an allocation of 70-80% in equity (stocks, equity mutual funds), 15-20% in debt instruments, and 5-10% in alternative investments.")
-        elif risk_profile == "moderate":
-            response_parts.append("With a moderate risk profile, a balanced allocation might include 50-60% in equity, 30-40% in debt, and 5-10% in alternatives or cash.")
-        else:
-            response_parts.append("With a conservative risk profile, consider 30-40% in equity, 50-60% in debt instruments, and 10-15% in cash or cash equivalents.")
-    
-    # Closing statement
-    response_parts.append("Remember that diversification across asset classes and regular investing are key to long-term financial success.")
-    
-    # Join all parts with appropriate spacing
-    full_response = " ".join(response_parts)
-    
-    return full_response
+    return " ".join(response_parts)
 
 if __name__ == "__main__":
-    # Start Flask server
-    print(f"Starting FinanceGURU backend with Mistral API ({MISTRAL_MODEL})")
+    print("🚀 Starting Enhanced FinanceGuru Backend")
+    print("📊 Features: Real-time stock data, crypto prices, market analysis")
+    print(f"🤖 AI Model: {MISTRAL_MODEL}")
+    print("🔥 Financial Data: yfinance integration")
     app.run(debug=True, host='0.0.0.0', port=5000)
