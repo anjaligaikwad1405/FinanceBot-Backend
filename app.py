@@ -5,7 +5,14 @@ from flask_cors import CORS
 from mistralai import Mistral
 
 app = Flask(__name__)
-CORS(app, origins=["https://finance-bot-frontend.vercel.app"])
+
+# 🧩 STEP 1: Updated CORS Configuration
+# Replace "https://your-frontend-name.vercel.app" with your actual Vercel URL
+CORS(app, 
+     origins=["https://finance-bot-frontend.vercel.app", "https://finance-bot-frontend.vercel.app/"], 
+     methods=["GET","POST","OPTIONS"], 
+     allow_headers=["Content-Type","Authorization"], 
+     supports_credentials=True)
 
 # Mistral API Configuration
 MISTRAL_API_KEY = "QKIr9flpqitrfwPJP1PsVf83I03jUUdd" # Replace with your actual API key or use environment variable
@@ -194,6 +201,11 @@ def get_financial_advice(user_input, sentiment_result=None, max_retries=3):
     except Exception as e:
         print(f"Error generating financial advice: {str(e)}")
         return "I'm having trouble connecting to our financial database. How about you ask me about basic investment strategies instead?"
+
+# 🧩 STEP 1 CONTINUED: Add root route to avoid "Not Found" errors
+@app.route('/')
+def home():
+    return "Backend is running!"
 
 @app.route('/api/sentiment', methods=['POST'])
 def analyze_sentiment_api():
