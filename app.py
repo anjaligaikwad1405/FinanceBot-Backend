@@ -2,10 +2,10 @@ import os
 import time
 import re
 import json
+import importlib
 from datetime import datetime, timedelta
 from flask import Flask, request, jsonify
 from flask_cors import CORS
-from mistralai import Mistral
 import yfinance as yf
 import requests
 from functools import lru_cache
@@ -23,19 +23,22 @@ CORS(app,
 MISTRAL_API_KEY = os.getenv("MISTRAL_API_KEY")
 FINNHUB_API_KEY = os.getenv("FINNHUB_API_KEY", "")
 ALPHA_VANTAGE_API_KEY = os.getenv("ALPHA_VANTAGE_API_KEY", "")
-MISTRAL_MODEL = "mistral-tiny"
+MISTRAL_MODEL = os.getenv("MISTRAL_MODEL", "mistral-tiny")
+OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3.1")
+OLLAMA_NUM_GPU = os.getenv("OLLAMA_NUM_GPU", "").strip()
+LLM_PROVIDER = os.getenv("LLM_PROVIDER", "").strip().lower()
 
-# Check if Mistral API key is available
-if not MISTRAL_API_KEY:
+if not LLM_PROVIDER:
+    LLM_PROVIDER = "mistral" if MISTRAL_API_KEY else "ollama"
+
+DEMO_MODE = LLM_PROVIDER == "mistral" and not MISTRAL_API_KEY
+
+if DEMO_MODE:
     print("⚠️  WARNING: MISTRAL_API_KEY not found in environment variables")
     print("   Please set your Mistral API key using:")
     print("   export MISTRAL_API_KEY='your_api_key_here'")
     print("   The app will run in demo mode with limited functionality.")
-    DEMO_MODE = True
-else:
-    DEMO_MODE = False
-    # Initialize Mistral client
-    client = Mistral(api_key=MISTRAL_API_KEY)
 
 # Cache for financial data to avoid excessive API calls
 financial_cache = {}
@@ -219,7 +222,8 @@ def extract_stock_symbols(text):
     symbols = set()
     for pattern in patterns:
         matches = re.findall(pattern, text.upper())
-        symbols.update(matches if isinstance(matches[0], str) if matches else [] for match in matches)
+        if matches:
+            symbols.update(matches)
     
     # Filter out common words that might match the pattern
     common_words = {'THE', 'AND', 'FOR', 'ARE', 'BUT', 'NOT', 'YOU', 'ALL', 'CAN', 'HER', 'WAS', 'ONE', 'OUR', 'HAD', 'BUT', 'WHAT', 'WERE', 'THEY', 'WE', 'BEEN', 'HAVE', 'THEIR', 'WHERE', 'WHO', 'OIL', 'GAS', 'CAR', 'NEW', 'OLD', 'BIG', 'GET', 'USE', 'MAN', 'DAY', 'TOO', 'ANY', 'MAY', 'SAY', 'SHE', 'ITS', 'HOW', 'TWO', 'WHO', 'BOY', 'DID', 'HAS', 'LET', 'PUT', 'END', 'WHY', 'TRY', 'GOD', 'SIX', 'DOG', 'EAT', 'AGO', 'SIT', 'FUN', 'BAD', 'YES', 'YET', 'ARM', 'FAR', 'OFF', 'BAG', 'BED', 'BET', 'BOX', 'BOY', 'BUS', 'BUY', 'CAN', 'CAR', 'CAT', 'CUP', 'CUT', 'DAD', 'DAY', 'DID', 'DOG', 'EAR', 'EAT', 'EGG', 'END', 'EYE', 'FAR', 'FED', 'FEW', 'FIX', 'FLY', 'FOR', 'FOX', 'FUN', 'GET', 'GOD', 'GOT', 'GUN', 'HAD', 'HAM', 'HAS', 'HAT', 'HER', 'HIM', 'HIS', 'HIT', 'HOT', 'HOW', 'HUG', 'ICE', 'ILL', 'JAM', 'JOB', 'JOY', 'KEY', 'KID', 'LAP', 'LAY', 'LEG', 'LET', 'LID', 'LIE', 'LOG', 'LOT', 'LOW', 'MAD', 'MAN', 'MAP', 'MAY', 'MOM', 'MUD', 'NET', 'NEW', 'NOD', 'NOT', 'NOW', 'NUT', 'ODD', 'OFF', 'OLD', 'ONE', 'OUR', 'OUT', 'OWN', 'PAD', 'PAN', 'PAY', 'PEN', 'PET', 'PIE', 'PIG', 'POT', 'PUT', 'RAN', 'RAT', 'RAW', 'RED', 'RID', 'RIP', 'ROW', 'RUB', 'RUG', 'RUN', 'SAD', 'SAT', 'SAW', 'SAY', 'SEA', 'SEE', 'SET', 'SHE', 'SIT', 'SIX', 'SKY', 'SON', 'SUN', 'TAX', 'TEA', 'TEN', 'THE', 'TIE', 'TIP', 'TOO', 'TOP', 'TOY', 'TRY', 'TWO', 'USE', 'VAN', 'WAR', 'WAS', 'WAY', 'WE', 'WET', 'WHO', 'WHY', 'WIN', 'WON', 'YES', 'YET', 'YOU', 'ZIP'}
@@ -263,7 +267,8 @@ def call_mistral_api(messages, temperature=0.7, max_tokens=800, max_retries=3):
     """Make a call to the Mistral API with retry logic"""
     if DEMO_MODE:
         return {"error": "Demo mode - Mistral API not available"}
-    
+
+    client = get_mistral_client()
     retry_delay = 1
     
     for attempt in range(max_retries):
@@ -289,6 +294,64 @@ def call_mistral_api(messages, temperature=0.7, max_tokens=800, max_retries=3):
     
     return {"error": "Maximum retry attempts exceeded"}
 
+@lru_cache(maxsize=1)
+def get_mistral_client():
+    """Lazy-load the Mistral client to keep optional dependency usage"""
+    mistral_module = importlib.import_module("mistralai")
+    return mistral_module.Mistral(api_key=MISTRAL_API_KEY)
+
+def call_ollama_api(messages, temperature=0.7, max_tokens=800, max_retries=2, timeout_s=30):
+    """Call the Ollama local API"""
+    num_gpu = None
+    if OLLAMA_NUM_GPU:
+        try:
+            num_gpu = int(OLLAMA_NUM_GPU)
+        except ValueError:
+            return {"error": f"Invalid OLLAMA_NUM_GPU value: {OLLAMA_NUM_GPU}"}
+
+    retry_delay = 1
+    payload = {
+        "model": OLLAMA_MODEL,
+        "messages": messages,
+        "stream": False,
+        "options": {
+            "temperature": temperature,
+            "num_predict": max_tokens,
+        }
+    }
+    if num_gpu is not None:
+        payload["options"]["num_gpu"] = num_gpu
+
+    for attempt in range(max_retries):
+        try:
+            response = requests.post(
+                f"{OLLAMA_BASE_URL}/api/chat",
+                json=payload,
+                timeout=timeout_s
+            )
+            response.raise_for_status()
+            data = response.json()
+            content = data.get("message", {}).get("content")
+            if not content:
+                return {"error": "Ollama response missing content"}
+            return {"content": content}
+        except requests.RequestException as exc:
+            if attempt < max_retries - 1:
+                time.sleep(retry_delay)
+                retry_delay *= 2
+                continue
+            return {"error": f"Ollama error: {exc}"}
+        except (ValueError, KeyError) as exc:
+            return {"error": f"Ollama response parsing error: {exc}"}
+
+def call_llm_api(messages, temperature=0.7, max_tokens=800):
+    """Route to configured LLM provider"""
+    if LLM_PROVIDER == "ollama":
+        return call_ollama_api(messages, temperature=temperature, max_tokens=max_tokens)
+    if LLM_PROVIDER == "mistral":
+        return call_mistral_api(messages, temperature=temperature, max_tokens=max_tokens)
+    return {"error": f"Unsupported LLM provider: {LLM_PROVIDER}"}
+
 def enhance_message_with_financial_data(user_input):
     """Enhance user message with real-time financial data"""
     stock_symbols = extract_stock_symbols(user_input)
@@ -305,7 +368,7 @@ def enhance_message_with_financial_data(user_input):
     crypto_keywords = ['bitcoin', 'btc', 'ethereum', 'eth', 'crypto', 'cryptocurrency']
     mentioned_crypto = [kw for kw in crypto_keywords if kw in user_input.lower()]
     
-    if mentioned_crypto and 'bitcoin' in mentioned_crypto or 'btc' in mentioned_crypto:
+    if mentioned_crypto and ('bitcoin' in mentioned_crypto or 'btc' in mentioned_crypto):
         crypto_data = financial_client.get_crypto_data('BTC')
         if 'error' not in crypto_data:
             financial_context += f"Bitcoin: ${crypto_data['current_price']} ({crypto_data['change']:+.2f}, {crypto_data['percent_change']:+.2f}%)\n"
@@ -319,9 +382,11 @@ def home():
         "status": "FinanceGuru Backend Running Locally",
         "version": "2.0-local",
         "demo_mode": DEMO_MODE,
+        "llm_provider": LLM_PROVIDER,
         "features": ["Real-time stock data", "Crypto prices", "Personalized advice", "Market analysis"],
         "endpoints": ["/api/chat", "/api/finance/quote/<symbol>", "/api/finance/crypto/<symbol>", "/api/health"],
-        "setup_note": "Set MISTRAL_API_KEY environment variable for full functionality"
+        "setup_note": "Set OLLAMA_MODEL or MISTRAL_API_KEY environment variable for full functionality",
+        "ollama_num_gpu": OLLAMA_NUM_GPU or None
     })
 
 @app.route('/api/finance/quote/<symbol>')
@@ -442,8 +507,8 @@ def chat():
         # Add current user input
         messages.append({"role": "user", "content": user_input})
         
-        # Call Mistral API or use fallback
-        response = call_mistral_api(messages)
+        # Call LLM API or use fallback
+        response = call_llm_api(messages)
         
         if isinstance(response, dict) and "error" in response:
             fallback_response = get_enhanced_fallback_response(user_input, financial_context)
@@ -455,7 +520,11 @@ def chat():
                 "fallback_used": True
             })
         
-        response_text = response.choices[0].message.content.strip()
+        response_text = None
+        if LLM_PROVIDER == "ollama":
+            response_text = response["content"].strip()
+        else:
+            response_text = response.choices[0].message.content.strip()
         
         # Remove redundant welcome messages
         if len(conversation_history) > 0 and "welcome to financeguru" in response_text.lower():
@@ -490,10 +559,22 @@ def health_check():
     """Enhanced health check with financial data sources"""
     try:
         # Test Mistral API
-        if DEMO_MODE:
-            mistral_status = "demo mode - API key not provided"
-        else:
-            mistral_status = "connected" if MISTRAL_API_KEY and len(MISTRAL_API_KEY) > 10 else "error: Invalid API key"
+        mistral_status = "disabled"
+        ollama_status = "disabled"
+        if LLM_PROVIDER == "mistral":
+            if DEMO_MODE:
+                mistral_status = "demo mode - API key not provided"
+            else:
+                mistral_status = "connected" if MISTRAL_API_KEY and len(MISTRAL_API_KEY) > 10 else "error: Invalid API key"
+        if LLM_PROVIDER == "ollama":
+            try:
+                response = requests.get(f"{OLLAMA_BASE_URL}/api/tags", timeout=5)
+                if response.ok:
+                    ollama_status = "connected"
+                else:
+                    ollama_status = f"error: {response.status_code}"
+            except requests.RequestException as exc:
+                ollama_status = f"error: {exc}"
         
         # Test financial data
         try:
@@ -502,15 +583,22 @@ def health_check():
         except Exception as e:
             yfinance_status = f"error: {str(e)}"
         
-        overall_status = "ok" if (mistral_status == "connected" or DEMO_MODE) and "error" not in yfinance_status else "degraded"
+        llm_ok = (
+            (LLM_PROVIDER == "mistral" and (mistral_status == "connected" or DEMO_MODE))
+            or (LLM_PROVIDER == "ollama" and ollama_status == "connected")
+        )
+        overall_status = "ok" if llm_ok and "error" not in yfinance_status else "degraded"
         
         return jsonify({
             "status": overall_status,
             "mistral_api": mistral_status,
+            "ollama_api": ollama_status,
             "yfinance": yfinance_status,
-            "model": MISTRAL_MODEL,
+            "model": OLLAMA_MODEL if LLM_PROVIDER == "ollama" else MISTRAL_MODEL,
             "cache_size": len(financial_client.cache),
             "demo_mode": DEMO_MODE,
+            "llm_provider": LLM_PROVIDER,
+            "ollama_num_gpu": OLLAMA_NUM_GPU or None,
             "environment": "local",
             "timestamp": datetime.now().isoformat()
         })
@@ -572,7 +660,13 @@ if __name__ == "__main__":
         print("   Get your API key from: https://console.mistral.ai/")
         print("   Then run: export MISTRAL_API_KEY='your_api_key_here'")
     else:
-        print(f"🤖 AI Model: {MISTRAL_MODEL}")
+        if LLM_PROVIDER == "ollama":
+            print(f"🤖 AI Model: {OLLAMA_MODEL} (Ollama)")
+            print(f"🌐 Ollama URL: {OLLAMA_BASE_URL}")
+            if OLLAMA_NUM_GPU:
+                print(f"🧠 Ollama GPU(s): {OLLAMA_NUM_GPU}")
+        else:
+            print(f"🤖 AI Model: {MISTRAL_MODEL} (Mistral)")
     print("🔥 Financial Data: yfinance integration")
     print("🌐 Server running on: http://localhost:5000")
     print("📡 CORS enabled for local development")
