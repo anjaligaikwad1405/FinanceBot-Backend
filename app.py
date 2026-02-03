@@ -26,6 +26,7 @@ ALPHA_VANTAGE_API_KEY = os.getenv("ALPHA_VANTAGE_API_KEY", "")
 MISTRAL_MODEL = os.getenv("MISTRAL_MODEL", "mistral-tiny")
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3.1")
+OLLAMA_NUM_GPU = os.getenv("OLLAMA_NUM_GPU", "").strip()
 LLM_PROVIDER = os.getenv("LLM_PROVIDER", "").strip().lower()
 
 if not LLM_PROVIDER:
@@ -301,6 +302,13 @@ def get_mistral_client():
 
 def call_ollama_api(messages, temperature=0.7, max_tokens=800, max_retries=2, timeout_s=30):
     """Call the Ollama local API"""
+    num_gpu = None
+    if OLLAMA_NUM_GPU:
+        try:
+            num_gpu = int(OLLAMA_NUM_GPU)
+        except ValueError:
+            return {"error": f"Invalid OLLAMA_NUM_GPU value: {OLLAMA_NUM_GPU}"}
+
     retry_delay = 1
     payload = {
         "model": OLLAMA_MODEL,
@@ -308,9 +316,11 @@ def call_ollama_api(messages, temperature=0.7, max_tokens=800, max_retries=2, ti
         "stream": False,
         "options": {
             "temperature": temperature,
-            "num_predict": max_tokens
+            "num_predict": max_tokens,
         }
     }
+    if num_gpu is not None:
+        payload["options"]["num_gpu"] = num_gpu
 
     for attempt in range(max_retries):
         try:
@@ -375,7 +385,8 @@ def home():
         "llm_provider": LLM_PROVIDER,
         "features": ["Real-time stock data", "Crypto prices", "Personalized advice", "Market analysis"],
         "endpoints": ["/api/chat", "/api/finance/quote/<symbol>", "/api/finance/crypto/<symbol>", "/api/health"],
-        "setup_note": "Set OLLAMA_MODEL or MISTRAL_API_KEY environment variable for full functionality"
+        "setup_note": "Set OLLAMA_MODEL or MISTRAL_API_KEY environment variable for full functionality",
+        "ollama_num_gpu": OLLAMA_NUM_GPU or None
     })
 
 @app.route('/api/finance/quote/<symbol>')
@@ -587,6 +598,7 @@ def health_check():
             "cache_size": len(financial_client.cache),
             "demo_mode": DEMO_MODE,
             "llm_provider": LLM_PROVIDER,
+            "ollama_num_gpu": OLLAMA_NUM_GPU or None,
             "environment": "local",
             "timestamp": datetime.now().isoformat()
         })
@@ -651,6 +663,8 @@ if __name__ == "__main__":
         if LLM_PROVIDER == "ollama":
             print(f"🤖 AI Model: {OLLAMA_MODEL} (Ollama)")
             print(f"🌐 Ollama URL: {OLLAMA_BASE_URL}")
+            if OLLAMA_NUM_GPU:
+                print(f"🧠 Ollama GPU(s): {OLLAMA_NUM_GPU}")
         else:
             print(f"🤖 AI Model: {MISTRAL_MODEL} (Mistral)")
     print("🔥 Financial Data: yfinance integration")
